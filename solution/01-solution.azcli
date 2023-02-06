@@ -1,0 +1,331 @@
+az login --use-device-code
+
+az account list -o table
+
+UNIQUEID=$(openssl rand -hex 3)
+APPNAME=petclinic
+RESOURCE_GROUP=rg-$APPNAME-$UNIQUEID
+LOCATION=westeurope
+az group create -g $RESOURCE_GROUP -l $LOCATION
+
+###DATABASE
+MYSQL_SERVER_NAME=mysql-$APPNAME-$UNIQUEID
+MYSQL_ADMIN_USERNAME=myadmin
+MYSQL_ADMIN_PASSWORD=yadadada
+DATABASE_NAME=petclinic
+
+#Answered y to enable access to all IP's
+az mysql flexible-server create \
+    --admin-user myadmin \
+    --admin-password ${MYSQL_ADMIN_PASSWORD} \
+    --name ${MYSQL_SERVER_NAME} \
+    --resource-group ${RESOURCE_GROUP} 
+
+az mysql flexible-server db create \
+    --server-name $MYSQL_SERVER_NAME \
+    --resource-group $RESOURCE_GROUP \
+    -d $DATABASE_NAME
+
+az mysql flexible-server firewall-rule create \
+    --rule-name allAzureIPs \
+    --name ${MYSQL_SERVER_NAME} \
+    --resource-group ${RESOURCE_GROUP} \
+    --start-ip-address 0.0.0.0 --end-ip-address 0.0.0.0
+
+###ACR
+
+MYACR=acr$APPNAME$UNIQUEID
+az acr create \
+    -n $MYACR \
+    -g $RESOURCE_GROUP \
+    --sku Basic
+
+az extension add --name containerapp --upgrade
+az provider register --namespace Microsoft.App
+
+ACA_ENVIRONMENT=aca-$APPNAME-$UNIQUEID
+
+az containerapp env create \
+  --name $ACA_ENVIRONMENT \
+  --resource-group $RESOURCE_GROUP \
+  --location $LOCATION
+
+#First building and uploading all container images
+#Also created config repo and updated application.yml in config-server microservice with config repo link and PAT
+
+VERSION=2.7.6
+mvn clean package -DskipTests
+az acr login --name $MYACR
+mkdir -p staging-acr
+cd staging-acr
+
+cp ../spring-petclinic-api-gateway/target/spring-petclinic-api-gateway-$VERSION.jar spring-petclinic-api-gateway-$VERSION.jar
+cp ../spring-petclinic-admin-server/target/spring-petclinic-admin-server-$VERSION.jar spring-petclinic-admin-server-$VERSION.jar
+cp ../spring-petclinic-customers-service/target/spring-petclinic-customers-service-$VERSION.jar spring-petclinic-customers-service-$VERSION.jar
+cp ../spring-petclinic-visits-service/target/spring-petclinic-visits-service-$VERSION.jar spring-petclinic-visits-service-$VERSION.jar
+cp ../spring-petclinic-vets-service/target/spring-petclinic-vets-service-$VERSION.jar spring-petclinic-vets-service-$VERSION.jar
+cp ../spring-petclinic-config-server/target/spring-petclinic-config-server-$VERSION.jar spring-petclinic-config-server-$VERSION.jar
+cp ../spring-petclinic-discovery-server/target/spring-petclinic-discovery-server-$VERSION.jar spring-petclinic-discovery-server-$VERSION.jar
+
+az acr build \
+    --resource-group $RESOURCE_GROUP \
+    --registry $MYACR \
+    --image spring-petclinic-api-gateway:$VERSION \
+    --build-arg ARTIFACT_NAME=spring-petclinic-api-gateway-$VERSION.jar \
+    --build-arg APP_PORT=8080 \
+    .
+
+az acr repository list \
+   -n $MYACR
+
+az acr build \
+    --resource-group $RESOURCE_GROUP \
+    --registry $MYACR \
+    --image spring-petclinic-admin-server:$VERSION \
+    --build-arg ARTIFACT_NAME=spring-petclinic-admin-server-$VERSION.jar \
+    --build-arg APP_PORT=8080 \
+    .
+
+az acr build \
+    --resource-group $RESOURCE_GROUP \
+    --registry $MYACR \
+    --image spring-petclinic-customers-service:$VERSION \
+    --build-arg ARTIFACT_NAME=spring-petclinic-customers-service-$VERSION.jar \
+    --build-arg APP_PORT=8080 \
+    .
+
+az acr build \
+    --resource-group $RESOURCE_GROUP \
+    --registry $MYACR \
+    --image spring-petclinic-visits-service:$VERSION \
+    --build-arg ARTIFACT_NAME=spring-petclinic-visits-service-$VERSION.jar \
+    --build-arg APP_PORT=8080 \
+    .
+
+az acr build \
+    --resource-group $RESOURCE_GROUP \
+    --registry $MYACR \
+    --image spring-petclinic-vets-service:$VERSION \
+    --build-arg ARTIFACT_NAME=spring-petclinic-vets-service-$VERSION.jar \
+    --build-arg APP_PORT=8080 \
+    .
+
+az acr build \
+    --resource-group $RESOURCE_GROUP \
+    --registry $MYACR \
+    --image spring-petclinic-config-server:$VERSION \
+    --build-arg ARTIFACT_NAME=spring-petclinic-config-server-$VERSION.jar \
+    --build-arg APP_PORT=8888 \
+    .
+
+az acr build \
+    --resource-group $RESOURCE_GROUP \
+    --registry $MYACR \
+    --image spring-petclinic-discovery-server:$VERSION \
+    --build-arg ARTIFACT_NAME=spring-petclinic-discovery-server-$VERSION.jar \
+    --build-arg APP_PORT=8761 \
+    .
+
+az acr repository list \
+   -n $MYACR
+
+az acr repository show-tags \
+    -n $MYACR \
+    --repository spring-petclinic-customers-service
+
+
+#Try and deploy config server
+ACA_IDENTITY=uid-petclinic-$UNIQUEID
+az identity create --resource-group $RESOURCE_GROUP --name $ACA_IDENTITY --output json
+USER_ID=$(az identity show --resource-group $RESOURCE_GROUP --name $ACA_IDENTITY --query id --output tsv)
+SP_ID=$(az identity show --resource-group $RESOURCE_GROUP --name $ACA_IDENTITY --query principalId --output tsv)
+echo $USER_ID
+echo $SP_ID
+ACR_ID=$(az acr show --resource-group $RESOURCE_GROUP --name $MYACR --query id --output tsv)
+az role assignment create --assignee $SP_ID --scope $ACR_ID --role acrpull
+
+az containerapp create \
+  --name config-server \
+  --resource-group $RESOURCE_GROUP \
+  --ingress external \
+  --target-port 8888 \
+  --environment $ACA_ENVIRONMENT \
+  --user-assigned $USER_ID \
+  --registry-identity $USER_ID \
+  --registry-server ${MYACR}.azurecr.io \
+  --image ${MYACR}.azurecr.io/spring-petclinic-config-server:$VERSION
+
+# The above also creates the AcrPull role assignment in the background ... Which I don't have permissions to from a Tenant perspective, so error ... BUT the actual app creation is succesfull anyways ...
+
+CONFIG_FQDN=$(az containerapp show \
+  --resource-group $RESOURCE_GROUP \
+  --name config-server \
+  --query properties.configuration.ingress.fqdn \
+  -o tsv)
+
+echo $CONFIG_FQDN
+
+az containerapp create \
+  --name discovery-server \
+  --resource-group $RESOURCE_GROUP \
+  --ingress external \
+  --target-port 8761 \
+  --environment $ACA_ENVIRONMENT \
+  --user-assigned $USER_ID \
+  --registry-identity $USER_ID \
+  --registry-server ${MYACR}.azurecr.io \
+  --image ${MYACR}.azurecr.io/spring-petclinic-discovery-server:$VERSION \
+  --env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+az containerapp update \
+  --name discovery-server \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+az containerapp create \
+  --name api-gateway \
+  --resource-group $RESOURCE_GROUP \
+  --ingress external \
+  --target-port 8080 \
+  --environment $ACA_ENVIRONMENT \
+  --user-assigned $USER_ID \
+  --registry-identity $USER_ID \
+  --registry-server ${MYACR}.azurecr.io \
+  --image ${MYACR}.azurecr.io/spring-petclinic-api-gateway:$VERSION \
+  --env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+az containerapp update \
+  --name api-gateway \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+az containerapp create \
+  --name admin-server \
+  --resource-group $RESOURCE_GROUP \
+  --ingress external \
+  --target-port 8080 \
+  --environment $ACA_ENVIRONMENT \
+  --user-assigned $USER_ID \
+  --registry-identity $USER_ID \
+  --registry-server ${MYACR}.azurecr.io \
+  --image ${MYACR}.azurecr.io/spring-petclinic-admin-server:$VERSION \
+  --env-vars CONFIG_SERVER_URL=$CONFIG_FQDN
+
+az containerapp update \
+  --name admin-server \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+
+# az containerapp revision copy \
+#   --name config-server \
+#   --resource-group $RESOURCE_GROUP 
+
+# az containerapp revision list \
+#   --name config-server \
+#   --resource-group $RESOURCE_GROUP -o table
+
+az containerapp create \
+  --name customers-service \
+  --resource-group $RESOURCE_GROUP \
+  --ingress external \
+  --target-port 8080 \
+  --environment $ACA_ENVIRONMENT \
+  --user-assigned $USER_ID \
+  --registry-identity $USER_ID \
+  --registry-server ${MYACR}.azurecr.io \
+  --image ${MYACR}.azurecr.io/spring-petclinic-customers-service:$VERSION \
+  --env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+az containerapp update \
+  --name customers-service \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+
+# curl -H "Content-Type: application/json" -X POST -d '{"name":"foo"}' https://config-server.salmongrass-133eba20.westeurope.azurecontainerapps.io/actuator/env
+
+az containerapp revision restart \
+  --name config-server \
+  --resource-group $RESOURCE_GROUP \
+  --revision config-server--rev1
+
+#FEEDBACK: az cli statement comes back immediately saying restart succeeded, however the app is still 'restarting' and not yet available. It's even worse, portal says succeeded as well, but the actual restart still needs to happen, so also revision management in the portal thinks the revision is running. Log streaming is not available yet, so that one reports correct, but revision management does not. After a while the revision gets reported as 'Provisioning', but this takes a while!
+# The good news is that on the restart, the container does get pulled again from ACR :)
+
+#FEEDBACK: containers go to sleep if they don't get requests for a while. It then takes a while for the first request to be served again. I don't think we mention this in our docs. Also, portal then shows the revision is 'provisioning'
+
+az containerapp create \
+  --name vets-service \
+  --resource-group $RESOURCE_GROUP \
+  --ingress external \
+  --target-port 8080 \
+  --environment $ACA_ENVIRONMENT \
+  --user-assigned $USER_ID \
+  --registry-identity $USER_ID \
+  --registry-server ${MYACR}.azurecr.io \
+  --image ${MYACR}.azurecr.io/spring-petclinic-vets-service:$VERSION \
+  --env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+az containerapp create \
+  --name visits-service \
+  --resource-group $RESOURCE_GROUP \
+  --ingress external \
+  --target-port 8080 \
+  --environment $ACA_ENVIRONMENT \
+  --user-assigned $USER_ID \
+  --registry-identity $USER_ID \
+  --registry-server ${MYACR}.azurecr.io \
+  --image ${MYACR}.azurecr.io/spring-petclinic-visits-service:$VERSION \
+  --env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+az containerapp update \
+  --name config-server \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_FQDN
+
+az containerapp ingress enable \
+  -n config-server \
+  -g $RESOURCE_GROUP \
+  --type internal \
+  --target-port 8888
+
+CONFIG_INTERNAL_FQDN=$(az containerapp show \
+  --resource-group $RESOURCE_GROUP \
+  --name config-server \
+  --query properties.configuration.ingress.fqdn \
+  -o tsv)
+
+echo $CONFIG_INTERNAL_FQDN
+
+az containerapp update \
+  --name discovery-server \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_INTERNAL_FQDN
+
+az containerapp update \
+  --name admin-server \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_INTERNAL_FQDN
+
+az containerapp update \
+  --name customers-service \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_INTERNAL_FQDN
+
+az containerapp update \
+  --name visits-service \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_INTERNAL_FQDN
+
+az containerapp update \
+  --name vets-service \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_INTERNAL_FQDN
+
+az containerapp update \
+  --name api-gateway \
+  --resource-group $RESOURCE_GROUP \
+  --replace-env-vars CONFIG_SERVER_URL=https://$CONFIG_INTERNAL_FQDN
+
+
