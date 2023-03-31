@@ -1,3 +1,5 @@
+# Other solution: https://github.com/ezYakaEagle442/aca-java-petclinic-mic-srv
+
 az login --use-device-code
 
 az account list -o table
